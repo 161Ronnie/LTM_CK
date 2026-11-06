@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bản đồ - Gọi xe</title>
+<style>
+  html, body { height: 100%; margin: 0; font-family: Arial, sans-serif; }
+  #map { position: absolute; inset: 0; }
+  #msg { position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
+         text-align: center; padding: 24px; background: #f6f8fa; color: #1f2328;
+         font-size: 16px; line-height: 1.6; z-index: 10; white-space: pre-line; }
+  #hint { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); z-index: 5;
+          background: #fff; color: #1f2328; padding: 8px 16px; border-radius: 20px;
+          font-size: 14px; font-weight: bold; box-shadow: 0 2px 8px rgba(0,0,0,.35);
+          display: none; max-width: 80%; text-align: center; }
+  .pin { position: relative; width: 30px; height: 30px; transform: translateY(50%); }
+  .pin .dot { width: 30px; height: 30px; box-sizing: border-box; border-radius: 50%;
+              border: 3px solid #fff; box-shadow: 0 1px 5px rgba(0,0,0,.5); color: #fff;
+              font: bold 14px/24px Arial; text-align: center; }
+  .pin .lbl { position: absolute; top: 34px; left: 50%; transform: translateX(-50%);
+              padding: 1px 7px; background: #fff; border-radius: 8px; white-space: nowrap;
+              font: bold 11px Arial; box-shadow: 0 1px 3px rgba(0,0,0,.35); color: #1f2328; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="hint"></div>
+<div id="msg"></div>
+<script>
+// const API_KEY = __API_KEY_JSON__;
+const API_KEY = 'AIzaSyARpdNBqJZWfm59E9N4_Setb4NXdapOdq0';
+const STYLE = {
+  pickup: { color: '#2da44e', glyph: 'A', z: 3 },
+  dest:   { color: '#cf222e', glyph: 'B', z: 3 },
+  driver: { color: '#1f6feb', glyph: '🚗', z: 5 },
+  me:     { color: '#8250df', glyph: '', z: 2 },
+};
+
+let map = null, AdvMarker = null;
+let markers = {};          // key -> {kind, label, cur, handle, raf}
+let polylines = [];
+let version = -1, routesVersion = -1, lastViewId = -1, busy = false;
+
+const $ = id => document.getElementById(id);
+function showMsg(text) { const m = $('msg'); m.textContent = text; m.style.display = 'flex'; }
+function post(ev) {
+  fetch('event', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                   body: JSON.stringify(ev) }).catch(() => {});
+}
+
+// Mã lỗi Google ghi ra console khi key bị từ chối -> giải thích bằng tiếng Việt.
+const ERROR_HINTS = {
+  ApiNotActivatedMapError: 'Project chứa key này CHƯA bật "Maps JavaScript API". Hãy bật đúng project có key.',
+  ApiTargetBlockedMapError: 'Key đang bị giới hạn theo API nhưng danh sách KHÔNG có "Maps JavaScript API". ' +
+    'Vào Credentials → chọn key → API restrictions → thêm Maps JavaScript API (hoặc chọn Don\'t restrict key).',
+  BillingNotEnabledMapError: 'Project của key chưa bật thanh toán, hoặc tài khoản thanh toán chưa hoạt động. ' +
+    'Kiểm tra Billing có gắn đúng project chứa key.',
+  RefererNotAllowedMapError: 'Key đang giới hạn HTTP referrer. Vào Credentials → key → Application restrictions → chọn None.',
+  RequestDeniedMapError: 'Key bị từ chối. Thường do "Application restrictions" (IP addresses / Android / iOS). Hãy chọn None.',
+  InvalidKeyMapError: 'Key không tồn tại: sai/thiếu ký tự, hoặc đã bị xóa. So lại với key hiển thị bên dưới.',
+  MissingKeyMapError: 'Chưa có key.',
+  ExpiredKeyMapError: 'Key đã hết hạn.',
+  OverQuotaMapError: 'Đã vượt hạn mức sử dụng.',
+  ProjectDeniedMapError: 'Project bị Google từ chối/vô hiệu hóa. Kiểm tra trạng thái project và thanh toán.',
+};
+let authFailed = false, googleErrorCode = '';
+
+function maskedKey() {
+  if (!API_KEY) return '(trống)';
+  return API_KEY.slice(0, 6) + '…' + API_KEY.slice(-4) + '  (' + API_KEY.length + ' ký tự)';
+}
+
+function renderAuthError() {
+  if (!authFailed) return;
+  const hint = ERROR_HINTS[googleErrorCode] ||
+    'Google không nêu rõ lý do. Kiểm tra: đúng key, đúng project, đã bật Maps JavaScript API, ' +
+    'đã bật thanh toán, API restrictions có Maps JavaScript API, Application restrictions = None.';
+  const text = 'Google Maps từ chối API key.\n\nMã lỗi: ' + (googleErrorCode || '(không rõ)') +
+               '\n' + hint + '\n\nKey đang dùng: ' + maskedKey() +
+               '\n(Key này phải đúng là key bạn vừa tạo; key lấy từ biến môi trường hoặc file google_maps_key.txt)';
+  showMsg(text);
+  post({ type: 'error', message: text });
+}
+
+window.gm_authFailure = () => { authFailed = true; setTimeout(renderAuthError, 300); };
+
+// Google in mã lỗi ra console ("Google Maps JavaScript API error: XxxMapError") -> bắt lấy.
+for (const level of ['error', 'warn']) {
+  const original = console[level].bind(console);
+  console[level] = (...args) => {
+    try {
+      const m = /Google Maps JavaScript API (?:error|warning): (\w+)/.exec(args.join(' '));
+      if (m && m[1] in ERROR_HINTS) { googleErrorCode = m[1]; renderAuthError(); }
+    } catch (e) { /* bỏ qua */ }
+    original(...args);
+  };
+}
+
+function loadGoogleMaps() {
+  if (!API_KEY) {
+    showMsg('Chưa có Google Maps API key.\n\nĐặt biến môi trường GOOGLE_MAPS_API_KEY ' +
+            'hoặc tạo file google_maps_key.txt rồi chạy lại Client.');
+    return;
+  }
+  const s = document.createElement('script');
+  s.src = 'https://maps.googleapis.com/maps/api/js?key=' + encodeURIComponent(API_KEY) +
+          '&callback=initMap&loading=async&v=weekly&language=vi&region=VN';
+  s.async = true;
+  s.onerror = () => showMsg('Không tải được Google Maps.\nHãy kiểm tra kết nối Internet.');
+  document.head.appendChild(s);
+}
+
+async function initMap() {
+  try {
+    const lib = await google.maps.importLibrary('marker');
+    AdvMarker = lib.AdvancedMarkerElement || null;
+  } catch (e) { AdvMarker = null; }
+  map = new google.maps.Map($('map'), {
+    center: { lat: 10.7769, lng: 106.7009 }, zoom: 14, mapId: 'DEMO_MAP_ID',
+    clickableIcons: false, gestureHandling: 'greedy',
+    mapTypeControl: false, streetViewControl: false, fullscreenControl: false,
+  });
+  map.addListener('click', e => post({ type: 'click', lat: e.latLng.lat(), lng: e.latLng.lng() }));
+  post({ type: 'ready' });
+  setInterval(poll, 250);
+}
+window.initMap = initMap;
+
+// ---------------------------------------------------------------- marker
+function pinElement(style, label) {
+  const root = document.createElement('div'); root.className = 'pin';
+  const dot = document.createElement('div'); dot.className = 'dot';
+  dot.style.background = style.color; dot.textContent = style.glyph;
+  root.appendChild(dot);
+  if (label) { const l = document.createElement('div'); l.className = 'lbl'; l.textContent = label; root.appendChild(l); }
+  return root;
+}
+
+function createMarker(kind, label, pos) {
+  const st = STYLE[kind] || STYLE.me;
+  if (AdvMarker) {
+    const m = new AdvMarker({ map, position: pos, content: pinElement(st, label), zIndex: st.z });
+    return { set: p => { m.position = p; }, remove: () => { m.map = null; } };
+  }
+  const m = new google.maps.Marker({
+    map, position: pos, title: label || '', zIndex: st.z,
+    icon: { path: google.maps.SymbolPath.CIRCLE, scale: 14, fillColor: st.color, fillOpacity: 1,
+            strokeColor: '#fff', strokeWeight: 3 },
+    label: { text: st.glyph, color: '#fff', fontWeight: 'bold' },
+  });
+  return { set: p => m.setPosition(p), remove: () => m.setMap(null) };
+}
+
+function removeMarker(rec) { cancelAnimationFrame(rec.raf); rec.handle.remove(); }
+
+// Xe chạy mượt tới vị trí mới thay vì "nhảy" tức thì (hiệu ứng GPS tracking).
+function glideTo(rec, to) {
+  cancelAnimationFrame(rec.raf);
+  const from = rec.cur, t0 = performance.now(), dur = 800;
+  const step = t => {
+    const k = Math.min(1, (t - t0) / dur);
+    rec.cur = { lat: from.lat + (to.lat - from.lat) * k, lng: from.lng + (to.lng - from.lng) * k };
+    rec.handle.set(rec.cur);
+    if (k < 1) rec.raf = requestAnimationFrame(step);
+  };
+  rec.raf = requestAnimationFrame(step);
+}
+
+function applyMarkers(scene) {
+  for (const key of Object.keys(markers)) {
+    if (!(key in scene)) { removeMarker(markers[key]); delete markers[key]; }
+  }
+  for (const [key, m] of Object.entries(scene)) {
+    const pos = { lat: m.lat, lng: m.lng };
+    const rec = markers[key];
+    if (rec && rec.kind === m.kind && rec.label === m.label) {
+      if (rec.cur.lat !== pos.lat || rec.cur.lng !== pos.lng) glideTo(rec, pos);
+    } else {
+      if (rec) removeMarker(rec);
+      markers[key] = { kind: m.kind, label: m.label, cur: pos, raf: 0,
+                       handle: createMarker(m.kind, m.label, pos) };
+    }
+  }
+}
+
+// ----------------------------------------------------------- tuyến đường
+function applyRoutes(routes) {
+  polylines.forEach(p => p.setMap(null));
+  polylines = [];
+  for (const r of routes) {
+    const path = r.points.map(([lat, lng]) => ({ lat, lng }));
+    // viền trắng bên dưới cho nổi trên nền bản đồ
+    polylines.push(new google.maps.Polyline({ map, path, strokeColor: '#fff', strokeWeight: 9, strokeOpacity: 1, zIndex: 1 }));
+    polylines.push(new google.maps.Polyline({ map, path, strokeColor: r.color, strokeWeight: 5, strokeOpacity: 0.95, zIndex: 2 }));
+  }
+}
+
+// -------------------------------------------------------------- khung nhìn
+function applyView(v) {
+  if (v.fit && v.fit.length) {
+    if (v.fit.length === 1) { map.setCenter({ lat: v.fit[0][0], lng: v.fit[0][1] }); map.setZoom(15); }
+    else {
+      const b = new google.maps.LatLngBounds();
+      v.fit.forEach(([lat, lng]) => b.extend({ lat, lng }));
+      map.fitBounds(b, 80);
+    }
+  } else if (v.center) {
+    map.setCenter({ lat: v.center[0], lng: v.center[1] });
+    if (v.zoom) map.setZoom(v.zoom);
+  }
+}
+
+function applyScene(d) {
+  applyMarkers(d.markers);
+  const hint = $('hint');
+  hint.textContent = d.hint || ''; hint.style.display = d.hint ? 'block' : 'none';
+  if (d.routes !== undefined) { applyRoutes(d.routes); routesVersion = d.rv; }
+  if (d.view && d.view.id !== lastViewId) { lastViewId = d.view.id; applyView(d.view); }
+}
+
+async function poll() {
+  if (busy || !map) return;
+  busy = true;
+  try {
+    const r = await fetch(`scene?v=${version}&rv=${routesVersion}`, { cache: 'no-store' });
+    const d = await r.json();
+    if (!d.same) { applyScene(d); version = d.v; }
+  } catch (e) { /* app đã đóng hoặc mất kết nối cục bộ: bỏ qua */ }
+  finally { busy = false; }
+}
+
+loadGoogleMaps();
+</script>
+</body>
+</html>
